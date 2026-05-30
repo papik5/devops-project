@@ -1,0 +1,119 @@
+name: CI/CD Pipeline – DevOps Demo
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-demo-app
+  APP_VERSION: ${{ github.run_number }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1 — CONTINUOUS INTEGRATION
+  # ──────────────────────────────────────────────────────────────────────────
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest
+
+      - name: Run basic tests
+        run: |
+          cd app
+          python -c "
+          from app import app
+          client = app.test_client()
+          r = client.get('/health')
+          assert r.status_code == 200, 'Health check failed'
+          r2 = client.get('/')
+          assert r2.status_code == 200, 'Index failed'
+          print('All tests passed')
+          "
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.DOCKER_IMAGE }}:${{ env.APP_VERSION }} \
+                       -t ${{ env.DOCKER_IMAGE }}:latest \
+                       ./app
+
+      - name: Test Docker container
+        run: |
+          docker run -d --name test_container \
+            -p 5000:5000 \
+            -e ENVIRONMENT=testing \
+            ${{ env.DOCKER_IMAGE }}:${{ env.APP_VERSION }}
+          sleep 5
+          curl -f http://localhost:5000/health || exit 1
+          docker stop test_container
+          docker rm test_container
+          echo "Container test passed"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2 — CONTINUOUS DELIVERY (only on push to main)
+  # ──────────────────────────────────────────────────────────────────────────
+  cd:
+    name: Push & Deploy
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:${{ env.APP_VERSION }}
+            ${{ env.DOCKER_IMAGE }}:latest
+
+      - name: Deploy to AWS EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/devops-project
+            export DOCKER_IMAGE=${{ env.DOCKER_IMAGE }}
+            export APP_VERSION=${{ env.APP_VERSION }}
+            docker pull ${{ env.DOCKER_IMAGE }}:${{ env.APP_VERSION }}
+            docker compose down
+            docker compose up -d
+            docker compose ps
+            echo "Deploy completed - version ${{ env.APP_VERSION }}"
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sleep 10
+            curl -f http://localhost/health || exit 1
+            echo "Health check passed - deployment successful"
